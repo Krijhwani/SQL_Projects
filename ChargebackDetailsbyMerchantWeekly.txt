@@ -1,0 +1,111 @@
+﻿USE [Database]
+GO
+
+
+/****** Object:  StoredProcedure [dbo].[spRpt_ChargebackDetailsbyMerchantWeekly_BitwiseTest]    Script Date: 9/29/2018 8:05:16 PM ******/
+SET ANSI_NULLS ON
+GO
+
+
+CREATE PROCEDURE [dbo].[spRpt_ChargebackDetailsbyMerchantWeekly_Test] 
+
+
+AS  
+
+
+BEGIN  
+
+
+        SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED
+        SET NOCOUNT ON; 
+
+
+SELECT       
+        dc.DisputeCaseID, 
+        d.Amount, 
+        dc.CardHolderNumberMask AS AccountNumber, 
+        M.MerchantNumber AS MerchantID, 
+        mou.ADSStoreID AS StoreNumber, 
+        CONVERT(datetime, CAST(COALESCE (dnp.TxnDateUTCID, pd.TxnDateUTCID) AS CHAR(8)), 101) AS OriginalTxnDate, 
+        tt.Description AS TxnType, 
+        dcta.Value AS ReasonCode, 
+        dctaa.Value AS ReasonCodeDescription, 
+        M.MerchantName, 
+        CONVERT(datetime, CAST(d.TxnDateUTCID AS CHAR(8)), 101) AS IncomingTxnDate, 
+        COALESCE (dnp.SICCode, h.SICCode) AS MCC, 
+        COALESCE (dnp.POSEntryMode, a.POSEntryMode) AS POSEntryMode, 
+        CASE WHEN posct.short_description IS NULL THEN 'Unknown' ELSE posct.short_description END AS POSEntryModeDescription, 
+        COALESCE (dnp.AuthCode, a.AuthCode) AS AuthCode, 
+        a.CardHolderIDMethod, 
+        mou.DBAState, 
+        ou.LegalName,
+        a.POSTerminalCapability,
+        dnp.MCCDesc,
+        dnp.ServiceCode
+FROM            
+        Merchants AS M WITH (nolock) LEFT OUTER JOIN
+        dbo.vwOrgUnitDBInfo AS ou WITH (nolock) ON ou.OrgUnitID = m.sequencekey INNER JOIN
+        dbo.TxnHeader AS h WITH (nolock) ON m.sequencekey = h.MerchantSequenceKey INNER JOIN
+        dbo.TxnDetail AS d WITH (nolock) ON h.TxnUUID = d.TxnUUID LEFT OUTER JOIN
+        dbo.TxnCardDataPayPal AS cp WITH (nolock) ON cp.TxnUUID = d.TxnUUID AND cp.TxnDetailID = d.TxnDetailID INNER JOIN
+        dbo.DisputeCaseTxn AS dct WITH (nolock) ON d.TxnUUID = dct.TxnUUID AND d.TxnDetailID = dct.TxnDetailID INNER JOIN
+        dbo.DisputeCase AS dc WITH (nolock) ON dct.DisputeCaseID = dc.DisputeCaseID LEFT OUTER JOIN
+        dbo.TxnParent AS p WITH (nolock) ON p.TxnUUID = d.TxnUUID AND p.TxnDetailID = d.TxnDetailID LEFT OUTER JOIN
+        dbo.TxnHeader AS h1 WITH (nolock) ON h1.TxnUUID = p.ParentTxnUUID LEFT OUTER JOIN
+        dbo.TxnDetail AS pd WITH (nolock) ON p.ParentTxnUUID = pd.TxnUUID AND p.ParentTxnDetailID = pd.TxnDetailID LEFT OUTER JOIN
+        dbo.TxnAuth AS a WITH (nolock) ON a.TxnUUID = pd.TxnUUID AND a.TxnDetailID = pd.TxnDetailID INNER JOIN
+        dbo.dim_sott_mapping_v AS sott WITH (nolock) ON d.ServiceOptionTxnTypeID = sott.ServiceOptionTxnTypeID INNER JOIN
+        dbo.TxnType AS tt WITH (nolock) ON sott.TxnTypeID = tt.TxnTypeID LEFT OUTER JOIN
+        dbo.DisputeCaseTxnAddendaValue AS dcta WITH (nolock) ON d.TxnUUID = dcta.TxnUUID AND d.TxnDetailID = dcta.TxnDetailID AND dcta.DisputeAddendaColumnID = '3' LEFT OUTER JOIN
+        dbo.DisputeCaseTxnAddendaValue AS dctaa WITH (nolock) ON d.TxnUUID = dctaa.TxnUUID AND d.TxnDetailID = dctaa.TxnDetailID AND dctaa.DisputeAddendaColumnID = '4' LEFT OUTER JOIN
+        (
+                SELECT        
+                        dc.DisputeCaseID, 
+                        h.SICCode,
+                        mcc.MCCDesc,
+                        a.AuthCode, 
+                        a.RefNum, 
+                        a.POSEntryMode, 
+                        d.TxnDateUTCID,
+                        tcd.ServiceCode
+                FROM            
+                        dbo.TxnHeader AS h WITH (nolock) INNER JOIN
+            dbo.TxnDetail AS d WITH (nolock) ON h.TxnUUID = d.TxnUUID INNER JOIN
+            dbo.TxnAuth AS a WITH (nolock) ON a.TxnUUID = d.TxnUUID AND a.TxnDetailID = d.TxnDetailID INNER JOIN
+            dbo.DisputeCaseTxn AS dct WITH (nolock) ON d.TxnUUID = dct.TxnUUID AND d.TxnDetailID = dct.TxnDetailID AND dct.ServiceOptionTxnTypeID IN (2, 20) INNER JOIN
+            dbo.DisputeCase AS dc WITH (nolock) ON dct.DisputeCaseID = dc.DisputeCaseID INNER JOIN
+                        EBIPassport.dbo.Dim_MCC mcc ON h.SICCode = mcc.MCC LEFT OUTER JOIN
+                        dbo.TxnCardData tcd ON d.TxnUUID = tcd.TxnUUID AND d.TxnDetailID = tcd.TxnDetailID) AS dnp ON dnp.DisputeCaseID = dc.DisputeCaseID LEFT OUTER JOIN
+                                (
+                                        SELECT        
+                                                TxnUUID, 
+                                                TxnDetailID, 
+                                                MAX(DisputeCaseTxnDispositionId) AS DisputeCaseTxnDispositionId
+                                        FROM            
+                                                dbo.DisputeCaseTxnDisposition WITH (nolock)
+                                        GROUP BY 
+                                                TxnUUID, 
+                                                TxnDetailID
+                                ) AS lst ON lst.TxnUUID = d.TxnUUID AND lst.TxnDetailID = d.TxnDetailID LEFT OUTER JOIN
+        dbo.DisputeCaseTxnDisposition AS ds WITH (nolock) ON lst.DisputeCaseTxnDispositionId = ds.DisputeCaseTxnDispositionId LEFT OUTER JOIN
+        dbo.POSEntryModeByCardType AS posct WITH (nolock) ON dc.CardTypeID = posct.CardTypeID AND COALESCE (dnp.POSEntryMode, a.POSEntryMode) = posct.Code LEFT OUTER JOIN
+        MSTR.Dim_MerchantOrgUnit_v AS mou ON m.MerchantNumber = mou.MerchantNumber
+WHERE 
+--m.sequencekey = 776234 -- and 
+        d.TxnDateUTC between convert(char(10),dateadd(DAY,-12,getdate()), 121) and convert(char(10),dateadd(day,-6,getdate()), 121) AND
+        --d.ServiceOptionTxnTypeID IN (43,57,58,64,140,141,147,213,227,228,239,240,241,242,243,245,247,248,249,250,251,252,253,254,366) 
+         And sott.IsChargeback = 1
+
+
+
+
+        END
+
+
+
+
+
+
+
+
+GO

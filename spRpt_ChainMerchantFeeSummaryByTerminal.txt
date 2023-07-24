@@ -1,0 +1,603 @@
+﻿USE [PassportDWMSTRStaging]
+GO
+
+
+/****** Object:  StoredProcedure [dbo].[spRpt_ChainMerchantFeeSummaryByTerminal]    Script Date: 7/19/2018 6:56:01 PM ******/
+SET ANSI_NULLS ON
+GO
+
+
+SET QUOTED_IDENTIFIER ON
+GO
+
+
+
+
+/***************************************************************************************
+Created By:                John Carnes
+Original Date:        10/07/2008, 12/05/08
+Description:        Retrieves data for the SSRS report, ChainMerchant Fee Summary By Terminal
+                                Code base for Generate MFS100.dtsx
+
+
+Modification Log:
+Date                Modified By:                FR/SWD #        Comment
+----------------------------------------------------------------------------------------
+20130624        Joshua Garza                US21934- Add Card Type Data to clones of existing reports
+                                                                                        Cloning from 
+                                                                                        spRpt_ChainMerchantFeeSummaryByTerminal
+20130806        Dave Russell                US23153 & US21934 Add Card type data and parent terminal ID
+                                                                                to report.
+10/09/13        drussell        Sprint 74 - US22597 Add Card Type and show/hide columns to report
+11/14/13    arasmussen      Sprint 76 - US26080 Add Interchange SOTTs for PayPal. 662,663,664,665,666,667,668,669,670,671,672,765,766,767,768
+12/4/13     arasmussen      Sprint 78 - US25224 Decommissing IRIS - Added IRIS to the fee section of report. 
+4/17/2014   arasmussen      US30670 - Add SOTTs for Amex OptBlue - Discount Fees 832,833,834,835,838,839,875,876,877,878,879,880,881,882
+                            /Interchange Fees 818,819,822,823,824,830,831,825,826,827/ The following fees will flow into other fees 816,817,820,821,828,829,871,872,873,874,883,884
+9/25/2014   arasmussen      US37484 - Add logic to identify and remove replacement txns.
+11/20/2014  arasmussen      US38794 - Add SOTT 920,921,893,894,926,935 to interchange fees, SOTT 918,919 will fall into HPS/Proc Other Fees.
+02/26/2014        rlockette                US42447 - Changed case statem;ent for TypeInd from hard coded sottids to flags in the
+                                                        new dim_sott_mapping_v view.
+05/07/2015  arasmussen      US47640 - Add new merchantreportingid from hpsterminals table.
+7/30/2015   arasmussen      US49507 - Remove HPS initiated Suspended or rejected txns.
+2/28/2017   arasmussen      DE24355 - Add WITH RECOMPILE to improve report render time.
+4/18/2018   Murugan V.E.    Performance tunning is done.
+5/09/2018   Khushbu P..    Fixed the amount and transaction fee amount issue.
+****************************************************************************************/
+
+
+/*****************************************************************************************
+IMPORTANT NOTE:PLEASE CONTACT ZACH BARTHOLOMEW EVERYTIME WE MAKE CHANGES TO THIS PROC.  THEY (DI) MAINTAIN A FILE VERSION PROC THAT THEY WILL NEED TO UPDATE.
+*****************************************************************************************/
+
+
+CREATE PROCEDURE [dbo].[spRpt_ChainMerchantFeeSummaryByTerminal](  
+ @UserID varchar(50)  
+ ,@StartDate datetime  
+ ,@EndDate datetime  
+ ,@SortOrder tinyint = NULL,  
+ @PivotColumns varchar(8000) = 'None'  
+)  
+  
+WITH RECOMPILE  
+  
+AS  
+  
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED  
+SET NOCOUNT ON  
+  
+ 
+
+
+--DECLARE @UserID varchar(50), @StartDate datetime, @EndDate datetime, @SortOrder tinyint, @ChainOID int, @PivotColumns varchar(8000) = 'None'
+--set @StartDate = '2018-01-01'
+--set @EndDate   = '2018-01-31'
+--set @SortOrder = NULL
+--SET @ChainOID = 60183 
+  
+ select  Value  INTO #TEST  FROM dbo.fn_Split(@PivotColumns, ',')  
+  
+--Filter using the integer version of the Business Date so that the index for this field can be used  
+DECLARE @intStartDate int, @intEndDate int  
+,@ChainOID int,@TerminalIDVisibleFlag varchar(1)  
+SET @intStartDate = CONVERT(char(8),@StartDate,112)--'20130131'--  
+SET @intEndDate = CONVERT(char(8),@EndDate,112)--'20130131'--  
+SET @ChainOID =  dbo.fFetchChainOIDByUserID(@UserID); 
+--------------------------------------------------------CHANGE for security------------------------------------------------  
+--REPLACES SECURITY PROC: dbo.spRpt_IsTerminalIDVisible  
+  
+
+
+SELECT Top 1  
+     @TerminalIDVisibleFlag = UPPER(LTRIM(RTRIM(ISNULL(tda.AttributeValue, 'N'))))  
+       
+ FROM   HPSMaster..OrgUnitAttribute cha (NOLOCK)  
+ JOIN   HPSMaster..OrgUnitAttribute tda (NOLOCK) ON (tda.OrgUnitID = cha.OrgUnitID AND tda.AttributeTypeID = 63)  
+  
+ WHERE   (cha.AttributeValue = CAST(@ChainOID as varchar(10)) AND cha.AttributeTypeID = 21 )  
+----------------------------------------------------------CHANGE for security------------------------------------------------  
+  
+--------------------------------------------------------------------------------------------------------------------------------  
+-- Define the temp tables needed for this report. FeeSummryByTerminal contains the detail of each transaction  
+-- and feeagg aggregates that data with the terminal information in preparation for the pivot  
+--------------------------------------------------------------------------------------------------------------------------------  
+
+
+CREATE TABLE #FeeSummryByTerminal
+        (
+                MerchantSequenceKey                int                                NOT NULL
+                ,MerchantNumber                        varchar(20)                NULL
+                ,MerchantName                        varchar(40)                NULL
+                ,TerminalNumber                        varchar(50)                NULL
+                ,TypeInd                                varchar(20)                NULL
+                ,CardType                                varchar(20)                NULL
+                ,Amount                                        decimal(18,10)        NULL
+        )
+        
+CREATE TABLE #feeagg
+        (
+                MerchantSequenceKey                        int                                NOT NULL
+                ,MerchantNumber                                varchar(20)                NULL
+                ,MerchantName                                varchar(40)                NULL
+                ,TerminalID                                        varchar(50)                NULL
+                ,TerminalNumber                                varchar(50)                NULL
+                ,EquipLocDesc                                varchar(100)        NULL
+                ,MerchantDefinedAccountDescription  varchar(100)    NULL
+                ,TypeInd                                        varchar(20)                NULL
+                ,CardType                                        varchar(20)                NULL
+                ,Amount                                                decimal(18,10)        NULL
+        )
+--------------------------------------------------------------------------------------------------------------------------------
+-- Get sales data details from txnDetail. This will be a column in the pivot
+--------------------------------------------------------------------------------------------------------------------------------
+
+
+select txnuuid, mh.merchantsequencekey, feereportdateid, txnreportdateid
+into #merchantheader
+FROM merchantheader mh with(nolock)
+     inner join dbo.hpstChainList c on mh.MerchantSequenceKey = c.MerchantSequenceKey
+     and  ChainOID =@ChainOID
+where          (mh.TxnReportDateID BETWEEN @intStartDate AND @intEndDate
+                        or
+                        mh.FeeReportDateID BETWEEN @intStartDate AND @intEndDate
+                        )
+create unique clustered index cidx1 on #merchantheader (txnuuid, merchantsequencekey)
+
+
+declare @maxtxnuuid bigint, @mintxnuuid bigint
+
+
+set @maxtxnuuid = (select max(txnuuid) from #merchantheader )
+set @mintxnuuid = (select min(txnuuid) from #merchantheader )
+
+
+select 
+SequenceKey,MerchantNumber,MerchantName into #Merchants from Merchants 
+
+
+SELECT
+        h.TxnUUID,
+        h.MerchantSequenceKey,
+        m.MerchantNumber,
+        m.MerchantName,
+        h.TerminalNumber,
+        h.submitterid,
+        mh.feereportdateid,
+        mh.txnreportdateid
+into #TxnHeader
+FROM #merchantheader mh 
+        join dbo.TxnHeader as h with (nolock) on h.txnuuid = mh.txnuuid
+                and h.txnuuid between @mintxnuuid and @maxtxnuuid
+                AND PassportDW.$PARTITION.PF_TxnHeader(h.txnuuid)  
+                BETWEEN PassportDW.$PARTITION.PF_TxnHeader(@mintxnuuid) 
+                AND PassportDW.$PARTITION.PF_TxnHeader(@maxtxnuuid)                         
+        JOIN HPSMASTER.dbo.Merchants as m with (nolock) ON mh.MerchantSequenceKey = m.SequenceKey
+
+
+create unique clustered index cidx1 on #TxnHeader (txnuuid)
+
+
+SELECT
+        d.TxnUUID,
+        d.txndetailid,
+        d.ServiceOptionTxnTypeID,
+        d.amount
+into #TxnDetail
+FROM #merchantheader mh 
+        join dbo.TxnDetail as d with (nolock) on d.txnuuid = mh.txnuuid
+                and d.txnuuid between @mintxnuuid and @maxtxnuuid
+                AND PassportDW.$PARTITION.PF_TxnDetail(d.txnuuid)  
+                BETWEEN PassportDW.$PARTITION.PF_TxnDetail(@mintxnuuid) 
+                AND PassportDW.$PARTITION.PF_TxnDetail(@maxtxnuuid)                         
+create unique clustered index cidx1 on #TxnDetail(txnuuid, txndetailid)
+
+
+SELECT
+        tcd.TxnUUID,
+        tcd.txndetailid,
+        tcd.cardtypeid,
+        ct.description
+into #TxnCardData
+FROM #merchantheader mh 
+        join dbo.TxnCardData as tcd with (nolock) on tcd.txnuuid = mh.txnuuid
+                and tcd.txnuuid between @mintxnuuid and @maxtxnuuid
+                AND PassportDW.$PARTITION.PF_TxnCardData(tcd.txnuuid)  
+                BETWEEN PassportDW.$PARTITION.PF_TxncardData(@mintxnuuid) 
+                AND PassportDW.$PARTITION.PF_TxnCardData(@maxtxnuuid)                         
+        LEFT JOIN CardType CT with (nolock) ON tcd.CardTypeID=CT.CardTypeID
+
+
+create unique clustered index cidx1 on #TxnCardData (txnuuid, txndetailid)
+
+
+SELECT
+        tp.txnuuid,
+        tp.txndetailid,
+        tp.parenttxnuuid,
+        tp.parenttxndetailid
+into #TxnParent
+from #TxnDetail d
+        JOIN TxnParent tp with(nolock) on d.txnuuid = tp.txnuuid and d.txndetailid = tp.txndetailid
+                and tp.txnuuid between @mintxnuuid and @maxtxnuuid
+
+
+create clustered index cidx1 on #TxnParent (parenttxnuuid,parenttxndetailid)
+
+
+SELECT
+        tp.txnuuid,
+        tp.txndetailid,
+        tdp.serviceoptiontxntypeid
+into #txndetailP
+from #TxnParent tp
+        join txndetail tdp with(nolock) on tp.parenttxnuuid = tdp.txnuuid and tp.parenttxndetailid = tdp.txndetailid
+
+
+create unique clustered index cidx1 on #txndetailP (txnuuid,txndetailid)
+
+
+INSERT INTO #FeeSummryByTerminal
+                SELECT
+                        h.MerchantSequenceKey,
+                        h.MerchantNumber,
+                        h.MerchantName,
+                        h.TerminalNumber,
+                        CASE WHEN d.ServiceOptionTxnTypeID = 2 AND tdp.serviceoptiontxntypeid in (64,65) then 'ReplacementTxn'
+                                 WHEN d.ServiceOptionTxnTypeID = 20 AND tdp.serviceoptiontxntypeid in (64,65) then 'ReplacementTxn' 
+                                 WHEN d.ServiceOptionTxnTypeID = 2 and h.submitterid = 6 and ts.Duplicate = 'Y' then 'DuplicateSaleTxn'                   --20150730 ARR
+                                 WHEN d.ServiceOptionTxnTypeID = 20 and h.submitterid = 6 and  ts.Duplicate = 'Y' then 'DuplicateReturnTxn'              --20150730 ARR
+                                else 'GrossSalesSubmitted' end,
+                        tcd.Description CardType,
+            CASE sott.DebitCreditInd WHEN 'D' THEN -d.Amount ELSE d.Amount END
+        FROM #TxnHeader h
+                    JOIN #TxnDetail d with (nolock) ON d.TxnUUID = h.TxnUUID and d.ServiceOptionTxnTypeID IN (2,20) and h.TxnReportDateID BETWEEN @intStartDate AND @intEndDate
+                        LEFT JOIN #TxnCardData tcd with (nolock) ON d.TxnUUID = tcd.TxnUUID AND d.TxnDetailID = tcd.TxnDetailID
+            JOIN dbo.ServiceOptionTxnType as sott with (nolock) ON sott.ServiceOptionTxnTypeID = d.ServiceOptionTxnTypeID 
+                    LEFT JOIN #txndetailP tdp with(nolock) on d.txnuuid = tdp.txnuuid and d.txndetailid = tdp.txndetailid
+                        LEFT JOIN (Select Distinct TxnUUID, Duplicate = 'Y' from txnstatus with(nolock) where statusid in (7,8)
+                                                and txnuuid between @mintxnuuid and @maxtxnuuid
+                                          )ts 
+                   on d.txnuuid = ts.txnuuid                   
+SELECT
+        f.txnuuid,
+        f.txndetailid,
+        sott.IsDiscountFee,
+        sott.IsInterchangeFee,
+        sott.DebitCreditInd,
+        isnull(sum(f.Amount),0) Amount
+into #fee
+FROM #TxnHeader h 
+        JOIN dbo.TxnFee as f with (nolock) ON f.TxnUUID = h.TxnUUID and  h.FeeReportDateID BETWEEN @intStartDate AND @intEndDate and  h.submitterid not in ('23','24')
+                and f.txnuuid between @mintxnuuid and @maxtxnuuid
+                AND PassportDW.$PARTITION.PF_TxnFee(f.txnuuid)  
+                        BETWEEN PassportDW.$PARTITION.PF_TxnFee(@mintxnuuid) 
+                                AND PassportDW.$PARTITION.PF_TxnFee(@maxtxnuuid)                         
+        JOIN dbo.FeeRule as fr with (nolock) ON f.FeeRuleID = fr.FeeRuleID
+        JOIN dbo.dim_sott_mapping_v as sott with (nolock) ON fr.ServiceOptionTxnTypeID = sott.ServiceOptionTxnTypeID
+--where   
+group BY
+        f.txnuuid,
+        f.txndetailid,
+        sott.IsDiscountFee,
+        sott.IsInterchangeFee,
+        sott.DebitCreditInd
+
+
+create clustered index cidx1 on #fee (txnuuid, txndetailid)
+
+
+SELECT
+        pae.txnuuid,
+        pae.txndetailid,
+        pae.terminalid,
+        pae.cardtypeid,
+        ict.description
+into #pae
+FROM #merchantheader h 
+        JOIN PricingAuditAttributesAuthExtended pae with(nolock) on h.TxnUUID = pae.txnuuid 
+                AND pae.txnuuid BETWEEN @mintxnuuid AND @maxtxnuuid and h.FeeReportDateID BETWEEN @intStartDate AND @intEndDate
+        LEFT JOIN CardType ICT  with(nolock) ON pae.CardTypeID=ICT.CardTypeID
+
+
+create unique clustered index cidx1 on #pae (txnuuid, txndetailid)
+
+
+SELECT
+        tp.txnuuid,
+        tp.txndetailid,
+        pcd.cardtypeid,
+        pct.description
+into #pcd
+from #TxnParent tp
+        join txncarddata pcd with(nolock) on tp.parenttxnuuid = pcd.txnuuid and tp.parenttxndetailid = pcd.txndetailid
+        LEFT JOIN CardType PCT with(nolock) ON pcd.CardTypeID=PCT.CardTypeID
+
+
+create unique clustered index cidx1 on #pcd (txnuuid,txndetailid)
+
+
+SELECT distinct
+        tp.txnuuid,
+        ph.terminalnumber
+into #ph
+from #TxnParent tp
+         join txnheader ph with(nolock) on tp.parenttxnuuid = ph.txnuuid
+
+
+create unique clustered index cidx1 on #ph (txnuuid)
+
+
+INSERT INTO #FeeSummryByTerminal  
+ SELECT  
+   h.MerchantSequenceKey  
+  ,h.MerchantNumber  
+  ,h.MerchantName  
+  ,coalesce(h.TerminalNumber,ph.TerminalNumber,pae.TerminalID,' ') TerminalNumber  
+  ,CASE   
+   WHEN f.IsDiscountFee = 1 THEN 'DiscountFees'   --20150226 RFL  
+   WHEN f.IsInterchangeFee = 1 THEN 'InterchangeFees' --20150226 RFL  
+   ELSE 'OtherFees'  
+  END as TypeInd  
+  ,coalesce(tcd.Description,pcd.Description,pae.Description,' ')  
+  ,CASE f.DebitCreditInd WHEN 'D' THEN -f.Amount ELSE f.Amount END  
+ FROM   
+  #TxnHeader as h with (nolock)  
+  JOIN dbo.hpstChainList as cl with (nolock) ON h.merchantsequencekey = cl.MerchantSequenceKey  and  cl.ChainOID = @ChainOID AND  h.FeeReportDateID BETWEEN @intStartDate AND @intEndDate  and h.submitterid not in ('23','24')
+  join #fee f ON f.TxnUUID = h.TxnUUID 
+  LEFT JOIN #TxnCardData tcd with (nolock) ON f.TxnUUID = tcd.TxnUUID AND f.TxnDetailID = tcd.TxnDetailID
+  LEFT JOIN #ph ph with (nolock) ON f.txnUUID=ph.txnUUID
+  LEFT JOIN #pcd pcd with(nolock)ON f.txnUUID=pcd.txnUUID AND f.TxnDetailID=pcd.TxnDetailID
+  LEFT JOIN #pae pae on f.TxnUUID = pae.txnuuid and f.TxnDetailID = pae.TxnDetailID      
+
+
+drop table #TxnCardData
+drop table #ph
+drop table #TxnHeader
+drop table #pae
+drop table #pcd
+drop table #fee
+drop table #TxnParent
+
+
+
+
+--DROP TEMP TABLES
+IF OBJECT_ID('TEMPDB.DBO.#TxnCardData') IS NOT NULL DROP TABLE #TxnCardData
+IF OBJECT_ID('TEMPDB.DBO.#ph') IS NOT NULL DROP TABLE #ph
+IF OBJECT_ID('TEMPDB.DBO.#TxnHeader') IS NOT NULL DROP TABLE #TxnHeader
+IF OBJECT_ID('TEMPDB.DBO.#pae') IS NOT NULL DROP TABLE #pae
+IF OBJECT_ID('TEMPDB.DBO.#fee') IS NOT NULL DROP TABLE #fee
+IF OBJECT_ID('TEMPDB.DBO.#TxnParent') IS NOT NULL DROP TABLE #TxnParent
+-------------------------------------------------------------------------------------------------------------------------------
+-- Get merchant recurring fee data details. This will be included and totaled into the OtherFees column defined above  
+--------------------------------------------------------------------------------------------------------------------------------  
+    
+select 
+distinct mfr.MerchantSequenceKey,mfr.MerchantFeeRuleID,mfr.ServiceOptionTxnTypeID,sott.DebitCreditInd,sotc.TxnCategoryID into #MerchantFeeDetails
+from 
+        (select * from hpstChainList where ChainOID=@ChainOID)  c1
+        join #Merchants m on  c1.MerchantSequenceKey = m.SequenceKey  
+        JOIN MerchantFeeRule mfr with (nolock) ON mfr.MerchantSequenceKey = m.sequencekey
+        JOIN dbo.ServiceOptionTxnType as sott with (nolock) ON mfr.ServiceOptionTxnTypeID = sott.ServiceOptionTxnTypeID  
+        JOIN dbo.ServiceOptiontxnCategory as sotc with (nolock) on sott.ServiceOptionTxnCategoryID = sotc.ServiceOptionTxnCategoryID  
+        
+        select 
+        distinct mfd.MerchantFeeRuleID,
+        rf.Amount
+        into #MerchantFeeAmount
+        from 
+        #MerchantFeeDetails mfd
+        join MerchantFeeRuleAssessment mfa on mfd.MerchantFeeRuleID = mfa.MerchantFeeRuleID 
+        join TxnRecurringFee rf ON rf.MerchantFeeRuleAssessmentID = mfa.MerchantFeeRuleAssessmentID 
+        JOIN TxnRecurringFeeSettlementBatchRollup brp with(nolock) on (brp.TxnUUID=rf.TxnUUID and brp.TxnRecurringFeeSettlementBatchRollupID = rf.TxnRecurringFeeID)   
+        Join NachaFileHeader nfh with(nolock) on brp.nachafileheaderid = nfh.nachafileheaderid 
+        and nfh.FundingDateID BETWEEN @intStartDate AND @intEndDate
+        AND ISNULL(rf.Amount, 0) <> 0  
+        
+INSERT INTO #FeeSummryByTerminal  
+  SELECT  
+    m.sequencekey as [MerchantSequenceKey]  
+   ,m.MerchantNumber  
+   ,m.MerchantName  
+   ,'Recurring Fees'  
+   ,'OtherFees'  
+   ,'N/A'  
+   ,CASE WHEN md.DebitCreditInd = 'D'   
+          or md.TxnCategoryID = 4  
+   THEN -mfa.Amount ELSE mfa.Amount END  
+   from    
+                 #Merchants m 
+                JOIN #MerchantFeeDetails md on md.MerchantSequenceKey = m.sequencekey
+                join #MerchantFeeAmount mfa on mfa.MerchantFeeRuleID = md.MerchantFeeRuleID
+  
+IF OBJECT_ID('TEMPDB.DBO.#MerchantFeeDetails') IS NOT NULL DROP TABLE #MerchantFeeDetails
+IF OBJECT_ID('TEMPDB.DBO.#MerchantFeeAmount') IS NOT NULL DROP TABLE #MerchantFeeAmount
+------------------------------------------------------------------------------------------------------------------------------------  
+------ Get transaction fee data from PassportMerchantFeeByTerminalAgg aggregate table. This will be a column in the pivot  
+------------------------------------------------------------------------------------------------------------------------------------  
+     
+INSERT INTO #FeeSummryByTerminal  
+  SELECT   
+   th.MerchantSequencekey  
+   ,m.MerchantNumber  
+   ,m.MerchantName  
+   ,th.TerminalNumber  
+   ,'TransactionFees' TypeInd   
+   ,CT.Description  
+   ,CASE sott.DebitCreditInd WHEN 'D' THEN -th.Fees ELSE th.Fees END as Amount   
+  FROM   
+   passportdw.[dbo].[PassportMerchantFeeByTerminalAgg] th  
+     JOIN dbo.Merchants m with(nolock) ON th.MerchantSequenceKey = m.SequenceKey  
+   JOIN dbo.hpstChainList cl with(nolock) ON m.SequenceKey = cl.MerchantSequenceKey  
+   JOIN dbo.ServiceOptionTxnType sott with(nolock) ON th.ServiceOptionTxnTypeID = sott.ServiceOptionTxnTypeID  
+   LEFT JOIN CardType CT with(nolock)  
+    ON th.CardTypeID=CT.CardTypeID  
+  WHERE cl.ChainOID = @ChainOID AND th.FeeReportDateID BETWEEN @intStartDate AND @intEndDate  
+          
+--------------------------------------------------------------------------------------------------------------------------------  
+-- define the merchant terminal variable table and fill it with the active merchants terminal info  
+--------------------------------------------------------------------------------------------------------------------------------  
+  
+DECLARE @MerchantTerminals TABLE   
+ (  
+  TerminalOID            int   NULL  
+  ,MerchantSequenceKey         int   NOT NULL  
+  ,TerminalNumber           varchar(50) NULL  
+  ,TerminalID            varchar(50) NULL  
+  ,EquipLocDesc           varchar(60) NULL  
+  ,MerchantDefinedAccountDescription  varchar(100)    NULL  
+ )  
+ 
+INSERT INTO @MerchantTerminals  
+  SELECT  
+   MAX(t.TerminalOID) as [TerminalOID],  
+   r.MerchantSequenceKey,  
+   t.TerminalNumber,  
+   ISNULL(mtc.TermIdentifier, 'N/A') as [TerminalID],  
+   MAX(COALESCE(t.EquipLocDesc,'')) as [EquipLocDesc],  
+   MAX(COALESCE(t.MerchantReportingID,'')) as [MerchantDefinedAccountDescription]  
+  FROM dbo.hpstTerminals as t with (nolock)  
+   JOIN dbo.hpstMercEquipment as e with (nolock) ON e.MercEquipmentOID = t.MercEquipmentOID  
+   JOIN dbo.hpstMercEquipReq as r with (nolock) ON e.MercEquipReqOID = r.MercEquipReqOID  
+   JOIN dbo.hpstChainlist as cl with (nolock) ON cl.MerchantSequenceKey = r.MerchantSequenceKey  
+   LEFT JOIN dbo.MerchantTerminalCrossReference as mtc with (nolock)  
+    ON t.TerminalNumber = mtc.TerminalNumber AND r.MerchantSequenceKey = mtc.MerchantSequenceKey  
+  WHERE  
+   t.[Status] = 'A'  
+   AND cl.ChainOID = @ChainOID  
+  GROUP BY  
+   r.MerchantSequenceKey, t.TerminalNumber, ISNULL(mtc.TermIdentifier, 'N/A') 
+--------------------------------------------------------------------------------------------------------------------------------  
+UPDATE #FeeSummryByTerminal  
+SET  CardType = CASE  
+      WHEN 'CardType' in (select Value from #Test)  
+       THEN CardType  
+      ELSE NULL  
+     END  
+  
+--------------------------------------------------------------------------------------------------------------------------------  
+-- Combine the detail data from the FeeSummryByTerminal temp table with the MerchantTerminals variable table and summarize  
+-- the amounts by the columns below.  
+--------------------------------------------------------------------------------------------------------------------------------  
+  
+ INSERT INTO #feeagg  
+ SELECT  
+  F.MerchantSequenceKey  
+  ,F.MerchantNumber  
+  ,F.MerchantName  
+  ,case  
+   when @TerminalIDVisibleFlag = 'Y'  
+    AND  
+    f.TerminalNumber='Recurring Fees'  
+    then 'Recurring Fees'  
+   when @TerminalIDVisibleFlag = 'Y'  
+     then ISNULL(t.TerminalID,'Terminal ID not found')  
+   else ''  
+  end as TerminalID  
+  ,case  
+   when @TerminalIDVisibleFlag = 'Y'  
+    AND  
+    f.TerminalNumber='Recurring Fees'  
+    then 'Recurring Fees'  
+   when @TerminalIDVisibleFlag = 'Y'  
+     then ISNULL(t.TerminalNumber,'Terminal Number not found')  
+   else ''  
+  end as TerminalNumber  
+  ,t.EquipLocDesc  
+  ,t.MerchantDefinedAccountDescription  
+  ,f.TypeInd  
+  ,f.CardType  
+  ,SUM(f.amount) as Amount  
+ FROM  
+  #FeeSummryByTerminal f  
+   LEFT JOIN   
+    @MerchantTerminals as t   
+    ON f.merchantSequenceKey = t.MerchantSequenceKey   
+     AND   
+     f.TerminalNumber = t.TerminalNumber  
+        Where typeind not in ('ReplacementTxn','DuplicateSaleTxn','DuplicateReturnTxn')  
+ GROUP BY  
+  F.MerchantSequenceKey  
+  ,F.MerchantNumber  
+  ,F.MerchantName  
+  ,case  
+   when @TerminalIDVisibleFlag = 'Y'  
+    AND  
+    f.TerminalNumber='Recurring Fees'  
+    then 'Recurring Fees'  
+   when @TerminalIDVisibleFlag = 'Y'  
+     then ISNULL(t.TerminalID,'Terminal ID not found')  
+   else ''  
+  end   
+  ,case  
+   when @TerminalIDVisibleFlag = 'Y'  
+    AND  
+    f.TerminalNumber='Recurring Fees'  
+    then 'Recurring Fees'  
+   when @TerminalIDVisibleFlag = 'Y'  
+     then ISNULL(t.TerminalNumber,'Terminal Number not found')  
+   else ''  
+  end  
+  ,t.EquipLocDesc  
+  ,t.MerchantDefinedAccountDescription  
+  ,f.TypeInd  
+  ,f.CardType  
+  
+--------------------------------------------------------------------------------------------------------------------------------  
+-- Pivot the data for the report from the feeagg temp table. This is the final output.  
+--------------------------------------------------------------------------------------------------------------------------------  
+  
+ SELECT   
+  x.MerchantSequenceKey,  
+  x.MerchantNumber,  
+  x.MerchantName,  
+  x.TerminalID,  
+  x.TerminalNumber,  
+  x.CardType,  
+  COALESCE(x.EquipLocDesc,'') as EquipLocDesc,  
+  COALESCE(x.MerchantDefinedAccountDescription,'') as MerchantDefinedAccountDescription,  
+  COALESCE(x.GrossSalesSubmitted,0) as GrossSalesSubmitted,  
+  -(ISNULL(x.DiscountFees,0) + ISNULL(x.InterchangeFees,0) + ISNULL(x.OtherFees,0) + ISNULL(x.TransactionFees,0)) as [TotalFeeAmount],  
+  -COALESCE(x.DiscountFees,0) as [DiscountFees],  
+  -COALESCE(x.InterchangeFees,0) as [InterchangeFees],  
+  ISNULL(-x.OtherFees,0) as [OtherFees],  
+  ISNULL(-x.TransactionFees,0) as [TransactionFees]  
+  into ##NewResulst
+   FROM  
+  (  
+   select   
+    *   
+   from   
+    #FeeAgg  
+  ) SourceTable  
+ PIVOT  
+ (  
+  SUM(Amount) FOR TypeInd IN   
+  (  
+   [GrossSalesSubmitted],  
+   [DiscountFees],  
+   [InterchangeFees],  
+   [OtherFees],  
+   [TransactionFees]  
+  )  
+ ) x  
+   
+  ORDER BY   
+    CASE WHEN @SortOrder = 1 THEN x.MerchantName + ',' + x.TerminalID ELSE NULL END,    
+    CASE WHEN @SortOrder = 2 THEN x.MerchantNumber + ',' + x.TerminalID ELSE NULL END,  
+    CASE WHEN @SortOrder <> 1 AND @SortOrder <> 2 THEN x.MerchantName + ',' + x.TerminalID ELSE NULL END  
+  
+--------------------------------------------------------------------------------------------------------------------------------  
+-- Drop temp tables.  
+--------------------------------------------------------------------------------------------------------------------------------  
+  
+IF OBJECT_ID('TEMPDB.DBO.#FeeSummryByTerminal') IS NOT NULL DROP TABLE #FeeSummryByTerminal
+IF OBJECT_ID('TEMPDB.DBO.#feeagg') IS NOT NULL DROP TABLE #feeagg
+IF OBJECT_ID('TEMPDB.DBO.#Merchants') IS NOT NULL DROP TABLE #Merchants
+IF OBJECT_ID('TEMPDB.DBO.#TEST') IS NOT NULL DROP TABLE #TEST
+
+
+
+
+
+
+GO
